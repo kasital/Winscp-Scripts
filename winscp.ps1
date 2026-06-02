@@ -36,8 +36,10 @@ $syncScript = Join-Path $sftpDir "SyncScript.txt"
 $actionLog  = Join-Path $sftpDir "ScriptActions_$dateStamp.log"
 $winScpLog  = Join-Path $sftpDir "WinScpLog_$dateStamp.log"
 
-# Connection string lives OUTSIDE this script so credentials/keys stay out of source.
-$sessionConfigFile = Join-Path $sftpDir "session.config"
+# Connection string (host, credentials, key, host fingerprint).
+# NOTE: this contains a plaintext password and a private-key path. Restrict who
+# can read this file on disk. Replace <rsa> with the real host fingerprint.
+$sessionUrl = 'sftp://test:password@78.43.22.66/ -hostkey="ssh-rsa 2048 <rsa>" -privatekey="C:\Keys\MOH\ReuthPrivatMOH.ppk"'
 
 # Retention (days)
 $backupAfterDays       = 1     # move local files older than this into backup
@@ -69,41 +71,6 @@ foreach ($dir in @($localFrom, $localTo, $backupDir, $sftpDir)) {
 }
 
 Add-Content -Path $actionLog -Value "=== Sync Started: $(Get-Date) ===" -Encoding UTF8
-
-# ============================================================================
-# Load session config (do NOT hardcode credentials here)
-# ============================================================================
-if (-not (Test-Path -LiteralPath $sessionConfigFile)) {
-@'
-# WinSCP "open" target. Put the full target on ONE non-comment line, for example:
-#
-# Key-based auth (recommended):
-#   sftp://test@78.43.22.66/ -hostkey="ssh-rsa 2048 xx:xx:xx:..." -privatekey="C:\Keys\MOH\ReuthPrivatMOH.ppk"
-#
-# Password auth:
-#   sftp://test:PASSWORD@78.43.22.66/ -hostkey="ssh-rsa 2048 xx:xx:xx:..."
-#
-# Replace the host fingerprint with the REAL one (get it from a manual WinSCP login).
-# Use either a private key OR a password, not both.
-'@ | Set-Content -Path $sessionConfigFile -Encoding UTF8
-
-    Write-Host "ERROR: Session config was missing. A template was created at:" -ForegroundColor Red
-    Write-Host "  $sessionConfigFile" -ForegroundColor Red
-    Write-Host "Fill in the connection details, restrict its permissions, then re-run." -ForegroundColor Yellow
-    Write-Log "ERROR: session.config missing - template created. Aborting."
-    exit 1
-}
-
-$sessionUrl = (Get-Content -LiteralPath $sessionConfigFile |
-               Where-Object { $_ -and ($_ -notmatch '^\s*#') } |
-               Select-Object -First 1)
-
-if ([string]::IsNullOrWhiteSpace($sessionUrl)) {
-    Write-Host "ERROR: $sessionConfigFile has no active connection line." -ForegroundColor Red
-    Write-Log "ERROR: session.config has no active connection line. Aborting."
-    exit 1
-}
-$sessionUrl = $sessionUrl.Trim()
 
 # ============================================================================
 # Locate WinSCP (check the common paths first; only recurse if not found)
