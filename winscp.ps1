@@ -1,152 +1,249 @@
-# Get current date string using native PowerShell cmdlet format
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Two-way SFTP synchronization (WinSCP) with dated local backup and retention cleanup.
+
+.DESCRIPTION
+    - Sends files from the local FROM folder to the remote, and pulls files from the
+      remote into the local TO folder.
+    - Moves "settled" local files into a dated backup snapshot.
+    - Cleans up old backup snapshots and old log files.
+
+.NOTES
+    Credentials are intentionally NOT stored in this script. The WinSCP "open" target
+    (host, key, host fingerprint) is read from an external, restricted-ACL file:
+        C:\SFTP\session.config
+    On first run the script creates a template there and exits so you can fill it in.
+#>
+
+# ============================================================================
+# Configuration
+# ============================================================================
 $dateStamp = Get-Date -Format "yyyyMMdd"
 
-# Define Variables
-$sessionUrl = 'sftp://test:password@78.43.22.66/ -hostkey="ssh-rsa 2048 <rsa>" -privatekey="C:\Keys\MOH\ReuthPrivatMOH.ppk"'
+# Local directories (NO trailing backslash - important for the WinSCP quoting below)
+$localFrom = "C:\SafesMOH\FROM"
+$localTo   = "C:\SafesMOH\TO"
+$backupDir = "C:\SafesMOH\Backup"
 
-# Local Directories
-$localFrom = "C:\SafesMOH\FROM\"
-$localTo = "C:\SafesMOH\TO\"
-$backupDir = "C:\SafesMOH\Backup\"
-
-# Remote Directories
+# Remote directories
 $remoteFrom = "/FROM_REUTH/"
-$remoteTo = "/TO_REUTH/"
+$remoteTo   = "/TO_REUTH/"
 
-# Script & Log Paths (Daily rotation applied)
-$sftpDir = "C:\SFTP"
-$syncScript = "C:\SFTP\SyncScript.txt"
-$actionLog = "C:\SFTP\ScriptActions_$dateStamp.log"
-$winScpLog = "C:\SFTP\WinScpLog_$dateStamp.log"
+# Script & log paths
+$sftpDir    = "C:\SFTP"
+$syncScript = Join-Path $sftpDir "SyncScript.txt"
+$actionLog  = Join-Path $sftpDir "ScriptActions_$dateStamp.log"
+$winScpLog  = Join-Path $sftpDir "WinScpLog_$dateStamp.log"
+
+# Connection string lives OUTSIDE this script so credentials/keys stay out of source.
+$sessionConfigFile = Join-Path $sftpDir "session.config"
+
+# Retention (days)
+$backupAfterDays       = 1     # move local files older than this into backup
+$deleteBackupAfterDays = 14    # delete backup snapshots older than this
+$deleteLogsAfterDays   = 60    # delete log files older than this
+
 $failedResults = @()
 
-# Ensure base directories exist
+# ============================================================================
+# Helpers
+# ============================================================================
+function Write-Log {
+    param([string]$Message)
+    Add-Content -Path $actionLog -Value ("{0} - {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) -Encoding UTF8
+}
+
+function Add-Failure {
+    param([string]$Action, [string]$Details)
+    $script:failedResults += [PSCustomObject]@{ Action = $Action; Status = "Failed"; Details = $Details }
+}
+
+# ============================================================================
+# Prepare directories & log
+# ============================================================================
 foreach ($dir in @($localFrom, $localTo, $backupDir, $sftpDir)) {
-    if (-not (Test-Path -Path $dir)) {
+    if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -Path $dir -ItemType Directory -Force | Out-Null
     }
 }
 
-# Add a starting entry to the local log file
 Add-Content -Path $actionLog -Value "=== Sync Started: $(Get-Date) ===" -Encoding UTF8
 
-# Locate WinSCP executable dynamically
-$winScpSearch = Get-ChildItem -Path "C:\Program Files*" -Filter "WinSCP.com" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($winScpSearch) {
-    $winScpPath = $winScpSearch.FullName
-} else {
-    $winScpPath = "C:\Program Files (x86)\WinSCP\WinSCP.com"
+# ============================================================================
+# Load session config (do NOT hardcode credentials here)
+# ============================================================================
+if (-not (Test-Path -LiteralPath $sessionConfigFile)) {
+@'
+# WinSCP "open" target. Put the full target on ONE non-comment line, for example:
+#
+# Key-based auth (recommended):
+#   sftp://test@78.43.22.66/ -hostkey="ssh-rsa 2048 xx:xx:xx:..." -privatekey="C:\Keys\MOH\ReuthPrivatMOH.ppk"
+#
+# Password auth:
+#   sftp://test:PASSWORD@78.43.22.66/ -hostkey="ssh-rsa 2048 xx:xx:xx:..."
+#
+# Replace the host fingerprint with the REAL one (get it from a manual WinSCP login).
+# Use either a private key OR a password, not both.
+'@ | Set-Content -Path $sessionConfigFile -Encoding UTF8
+
+    Write-Host "ERROR: Session config was missing. A template was created at:" -ForegroundColor Red
+    Write-Host "  $sessionConfigFile" -ForegroundColor Red
+    Write-Host "Fill in the connection details, restrict its permissions, then re-run." -ForegroundColor Yellow
+    Write-Log "ERROR: session.config missing - template created. Aborting."
+    exit 1
 }
 
-# 1. Create the Sync Script for WinSCP (Handling BOTH directions)
+$sessionUrl = (Get-Content -LiteralPath $sessionConfigFile |
+               Where-Object { $_ -and ($_ -notmatch '^\s*#') } |
+               Select-Object -First 1)
+
+if ([string]::IsNullOrWhiteSpace($sessionUrl)) {
+    Write-Host "ERROR: $sessionConfigFile has no active connection line." -ForegroundColor Red
+    Write-Log "ERROR: session.config has no active connection line. Aborting."
+    exit 1
+}
+$sessionUrl = $sessionUrl.Trim()
+
+# ============================================================================
+# Locate WinSCP (check the common paths first; only recurse if not found)
+# ============================================================================
+$winScpPath = @(
+    "C:\Program Files (x86)\WinSCP\WinSCP.com",
+    "C:\Program Files\WinSCP\WinSCP.com"
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+if (-not $winScpPath) {
+    $found = Get-ChildItem -Path "C:\Program Files*" -Filter "WinSCP.com" -Recurse -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if ($found) { $winScpPath = $found.FullName }
+}
+
+if (-not $winScpPath) {
+    Write-Host "ERROR: WinSCP.com not found." -ForegroundColor Red
+    Write-Log "ERROR: WinSCP.com not found. Aborting."
+    exit 1
+}
+
+# ============================================================================
+# 1. Build the WinSCP sync script (both directions)
+#    NOTE: local paths have NO trailing backslash, otherwise the trailing
+#    \" would be read by WinSCP as an escaped quote.
+# ============================================================================
 $syncCommands = @"
 option batch abort
 option confirm off
 open $sessionUrl
-# Send files TO the remote server (FROM local)
 synchronize remote -resumesupport=on "$localFrom" "$remoteFrom"
-# Receive files FROM the remote server (TO local)
-synchronize local -resumesupport=on "$localTo" "$remoteTo"
+synchronize local  -resumesupport=on "$localTo" "$remoteTo"
 exit
 "@
 
 $syncCommands | Set-Content -Path $syncScript -Encoding UTF8
 
-# 2. Execute WinSCP
-Add-Content -Path $actionLog -Value "$(Get-Date) - Starting WinSCP synchronization." -Encoding UTF8
+# ============================================================================
+# 2. Run WinSCP
+# ============================================================================
+Write-Log "Starting WinSCP synchronization."
 & "$winScpPath" /script="$syncScript" /log="$winScpLog" /ini=nul
 
 if ($LASTEXITCODE -ne 0) {
-    $failedResults += [PSCustomObject]@{
-        Action = "WinSCP Sync"
-        Status = "Failed"
-        Details = "Exit Code: $LASTEXITCODE. Check $winScpLog"
-    }
-    Add-Content -Path $actionLog -Value "$(Get-Date) - ERROR: WinSCP Sync failed with exit code $LASTEXITCODE" -Encoding UTF8
+    Add-Failure "WinSCP Sync" "Exit Code: $LASTEXITCODE. Check $winScpLog"
+    Write-Log "ERROR: WinSCP Sync failed with exit code $LASTEXITCODE"
 } else {
-    Add-Content -Path $actionLog -Value "$(Get-Date) - WinSCP Sync completed successfully." -Encoding UTF8
+    Write-Log "WinSCP Sync completed successfully."
 }
 
-# 3. Local File Management: Move files older than 1 day to Backup (Preserving Folders)
-$oneDayAgo = (Get-Date) - (New-TimeSpan -Days 1)
+# ============================================================================
+# 3. Move settled local files into a dated backup snapshot
+#    Backup layout:  C:\SafesMOH\Backup\FROM\yyyyMMdd\<relative path>\file
+#                    C:\SafesMOH\Backup\TO\yyyyMMdd\<relative path>\file
+#    - CreationTime is used (not LastWriteTime): WinSCP copies the remote
+#      modified-time onto downloaded files, so LastWriteTime can be old the
+#      moment a file arrives. CreationTime reflects when it landed locally.
+#    - Dated folders avoid same-name collisions across days.
+# ============================================================================
+$cutoffBackup = (Get-Date).AddDays(-$backupAfterDays)
 
-# Define an array to map source folders to their respective backup roots
 $foldersToBackup = @(
     @{ Source = $localFrom; BackupRoot = Join-Path $backupDir "FROM" },
-    @{ Source = $localTo; BackupRoot = Join-Path $backupDir "TO" }
+    @{ Source = $localTo;   BackupRoot = Join-Path $backupDir "TO" }
 )
 
-foreach ($folderMap in $foldersToBackup) {
-    $sourceRoot = $folderMap.Source
-    $backupRoot = $folderMap.BackupRoot
-    
-    # Get only files (leaving folders intact) older than 1 day
-    $oldFiles = Get-ChildItem -Path $sourceRoot -File -Recurse | Where-Object { $_.LastWriteTime -lt $oneDayAgo }
-    
+foreach ($map in $foldersToBackup) {
+    $sourceRoot = $map.Source
+    $datedRoot  = Join-Path $map.BackupRoot $dateStamp
+    if (-not (Test-Path -LiteralPath $sourceRoot)) { continue }
+
+    $oldFiles = Get-ChildItem -Path $sourceRoot -File -Recurse |
+                Where-Object { $_.CreationTime -lt $cutoffBackup }
+
     foreach ($file in $oldFiles) {
-        # Determine the relative path to maintain folder structure using native regex replace
-        $relativePath = $file.DirectoryName -replace [regex]::Escape($sourceRoot), ""
-        $targetFolder = Join-Path $backupRoot $relativePath
-        
-        # Ensure the destination subfolder exists in the Backup directory
-        if (-not (Test-Path -Path $targetFolder)) {
+        # Relative path computed by length (handles root-level files correctly)
+        $relativeDir  = $file.DirectoryName.Substring($sourceRoot.Length).TrimStart('\')
+        $targetFolder = if ($relativeDir) { Join-Path $datedRoot $relativeDir } else { $datedRoot }
+
+        if (-not (Test-Path -LiteralPath $targetFolder)) {
             New-Item -Path $targetFolder -ItemType Directory -Force | Out-Null
-            Add-Content -Path $actionLog -Value "$(Get-Date) - Created backup folder: $targetFolder" -Encoding UTF8
+            Write-Log "Created backup folder: $targetFolder"
         }
-        
+
         try {
-            Move-Item -Path $file.FullName -Destination $targetFolder -Force -ErrorAction Stop
-            Add-Content -Path $actionLog -Value "$(Get-Date) - Moved to backup: $($file.FullName)" -Encoding UTF8
+            Move-Item -LiteralPath $file.FullName -Destination $targetFolder -Force -ErrorAction Stop
+            Write-Log "Moved to backup: $($file.FullName)"
         } catch {
-            $failedResults += [PSCustomObject]@{
-                Action = "Move to Backup"
-                Status = "Failed"
-                Details = "File: $($file.Name) - $($_.Exception.Message)"
+            Add-Failure "Move to Backup" "File: $($file.Name) - $($_.Exception.Message)"
+            Write-Log "ERROR moving file: $($file.FullName) - $($_.Exception.Message)"
+        }
+    }
+}
+
+# ============================================================================
+# 4. Delete backup snapshots older than N days (by dated-folder name)
+# ============================================================================
+$cutoffDelete = (Get-Date).AddDays(-$deleteBackupAfterDays)
+
+foreach ($root in @((Join-Path $backupDir "FROM"), (Join-Path $backupDir "TO"))) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+
+    Get-ChildItem -Path $root -Directory | ForEach-Object {
+        $folderDate = New-Object DateTime
+        $parsed = [DateTime]::TryParseExact(
+            $_.Name, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None, [ref]$folderDate)
+
+        if ($parsed -and $folderDate -lt $cutoffDelete) {
+            try {
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                Write-Log "Deleted expired backup snapshot: $($_.FullName)"
+            } catch {
+                Add-Failure "Delete from Backup" "Folder: $($_.Name) - $($_.Exception.Message)"
+                Write-Log "ERROR deleting backup snapshot: $($_.FullName) - $($_.Exception.Message)"
             }
-            Add-Content -Path $actionLog -Value "$(Get-Date) - ERROR moving file: $($file.FullName)" -Encoding UTF8
         }
     }
 }
 
-# 4. Cleanup: Delete files older than 14 days from Backup (Preserving Folders)
-$fourteenDaysAgo = (Get-Date) - (New-TimeSpan -Days 14)
-
-# Target files only, deep inside the backup directory
-$expiredBackupFiles = Get-ChildItem -Path $backupDir -File -Recurse | Where-Object { $_.LastWriteTime -lt $fourteenDaysAgo }
-
-foreach ($file in $expiredBackupFiles) {
-    try {
-        Remove-Item -Path $file.FullName -Force -ErrorAction Stop
-        Add-Content -Path $actionLog -Value "$(Get-Date) - Deleted expired backup file: $($file.FullName)" -Encoding UTF8
-    } catch {
-        $failedResults += [PSCustomObject]@{
-            Action = "Delete from Backup"
-            Status = "Failed"
-            Details = "File: $($file.Name) - $($_.Exception.Message)"
-        }
-        Add-Content -Path $actionLog -Value "$(Get-Date) - ERROR deleting backup file: $($file.FullName)" -Encoding UTF8
-    }
-}
-
-# 5. Log Cleanup: Delete log files older than 60 days (2 months)
-$sixtyDaysAgo = (Get-Date) - (New-TimeSpan -Days 60)
-$expiredLogs = Get-ChildItem -Path $sftpDir -File -Filter "*.log" | Where-Object { $_.LastWriteTime -lt $sixtyDaysAgo }
+# ============================================================================
+# 5. Delete log files older than N days
+# ============================================================================
+$cutoffLogs = (Get-Date).AddDays(-$deleteLogsAfterDays)
+$expiredLogs = Get-ChildItem -Path $sftpDir -File -Filter "*.log" |
+               Where-Object { $_.LastWriteTime -lt $cutoffLogs }
 
 foreach ($logFile in $expiredLogs) {
     try {
-        Remove-Item -Path $logFile.FullName -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $logFile.FullName -Force -ErrorAction Stop
     } catch {
-        $failedResults += [PSCustomObject]@{
-            Action = "Delete Old Log"
-            Status = "Failed"
-            Details = "Log: $($logFile.Name) - $($_.Exception.Message)"
-        }
+        Add-Failure "Delete Old Log" "Log: $($logFile.Name) - $($_.Exception.Message)"
     }
 }
 
 Add-Content -Path $actionLog -Value "=== Sync Finished: $(Get-Date) ===`n" -Encoding UTF8
 
-# 6. Display Summary Table
+# ============================================================================
+# 6. Summary
+# ============================================================================
 if ($failedResults.Count -gt 0) {
     Write-Host "Process completed with errors. Review the table below and the log file at $actionLog" -ForegroundColor Yellow
     $failedResults | Format-Table -AutoSize
