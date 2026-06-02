@@ -27,8 +27,8 @@ $localTo   = "C:\SafesMOH\TO"
 $backupDir = "C:\SafesMOH\Backup"
 
 # Remote directories
-$remoteFrom = "/FROM_REUTH/"
-$remoteTo   = "/TO_REUTH/"
+$remoteFrom = "/FROM_REUTH/"   # remote OUTBOX: we upload local TO here
+$remoteTo   = "/TO_REUTH/"     # remote INBOX:  we download from here into local FROM
 
 # Script & log paths
 $sftpDir    = "C:\SFTP"
@@ -101,8 +101,10 @@ $syncCommands = @"
 option batch abort
 option confirm off
 open $sessionUrl
-synchronize remote -resumesupport=on "$localFrom" "$remoteFrom"
-synchronize local  -resumesupport=on "$localTo" "$remoteTo"
+# Upload: local TO  -> remote FROM_REUTH (push our outgoing files to Reuth)
+synchronize remote -resumesupport=on "$localTo" "$remoteFrom"
+# Download: remote TO_REUTH -> local FROM (pull files Reuth left for us)
+synchronize local  -resumesupport=on "$localFrom" "$remoteTo"
 exit
 "@
 
