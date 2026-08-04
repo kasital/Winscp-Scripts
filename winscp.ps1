@@ -35,6 +35,7 @@ $sftpDir    = "C:\SFTP"
 $syncScript = Join-Path $sftpDir "SyncScript.txt"
 $actionLog  = Join-Path $sftpDir "ScriptActions_$dateStamp.log"
 $winScpLog  = Join-Path $sftpDir "WinScpLog_$dateStamp.log"
+$winScpXml  = Join-Path $sftpDir "WinScpLog_$dateStamp.xml"
 
 # Connection string (host, credentials, key, host fingerprint).
 # NOTE: this contains a plaintext password and a private-key path. Restrict who
@@ -47,6 +48,7 @@ $deleteBackupAfterDays = 14    # delete backup snapshots older than this
 $deleteLogsAfterDays   = 60    # delete log files older than this
 
 $failedResults = @()
+$warnings      = @()
 
 # ============================================================================
 # Helpers
@@ -93,17 +95,38 @@ if (-not $winScpPath) {
 }
 
 # ============================================================================
+# 0. Pre-flight diagnostics: what is actually queued for upload?
+# ============================================================================
+$pendingUpload = @(Get-ChildItem -Path $localTo -File -Recurse -ErrorAction SilentlyContinue)
+Write-Log "Pre-flight: $($pendingUpload.Count) file(s) present in local TO ($localTo) for upload."
+foreach ($f in $pendingUpload) {
+    Write-Log "  queued: $($f.FullName) [$($f.Length) bytes]"
+}
+if ($pendingUpload.Count -eq 0) {
+    Write-Host "NOTE: local TO folder is empty - there is nothing to upload." -ForegroundColor Yellow
+    Write-Log "NOTE: local TO folder is empty - nothing to upload."
+}
+
+# ============================================================================
 # 1. Build the WinSCP sync script (both directions)
 #    NOTE: local paths have NO trailing backslash, otherwise the trailing
 #    \" would be read by WinSCP as an escaped quote.
 # ============================================================================
 $syncCommands = @"
-option batch abort
 option confirm off
 open $sessionUrl
-# Upload: local TO  -> remote FROM_REUTH (push our outgoing files to Reuth)
-synchronize remote -resumesupport=on "$localTo" "$remoteFrom"
-# Download: remote TO_REUTH -> local FROM (pull files Reuth left for us)
+# Upload: local TO -> remote FROM_REUTH.
+# batch=continue so a remote directory we are NOT allowed to create is skipped
+# instead of aborting the entire run.
+option batch continue
+cd $remoteFrom
+lcd $localTo
+# -criteria=size + -nopreservetime: do NOT try to set the remote file timestamp
+# after upload. Setting mtime requires file ownership; on a restricted server
+# that step fails and the file gets skipped even though the data went through.
+synchronize remote -criteria=size -nopreservetime -resumesupport=on "$localTo" "$remoteFrom"
+# Download: remote TO_REUTH -> local FROM. Strict: any error aborts.
+option batch abort
 synchronize local  -resumesupport=on "$localFrom" "$remoteTo"
 exit
 "@
@@ -114,13 +137,24 @@ $syncCommands | Set-Content -Path $syncScript -Encoding UTF8
 # 2. Run WinSCP
 # ============================================================================
 Write-Log "Starting WinSCP synchronization."
-& "$winScpPath" /script="$syncScript" /log="$winScpLog" /ini=nul
+& "$winScpPath" /script="$syncScript" /log="$winScpLog" /xmllog="$winScpXml" /ini=nul
 
-if ($LASTEXITCODE -ne 0) {
-    Add-Failure "WinSCP Sync" "Exit Code: $LASTEXITCODE. Check $winScpLog"
-    Write-Log "ERROR: WinSCP Sync failed with exit code $LASTEXITCODE"
-} else {
-    Write-Log "WinSCP Sync completed successfully."
+switch ($LASTEXITCODE) {
+    0 {
+        Write-Log "WinSCP Sync completed successfully."
+    }
+    1 {
+        # With 'batch continue' on the upload, exit code 1 means some items were
+        # skipped - typically a remote directory we are not allowed to create.
+        # Treated as a warning, not a hard failure.
+        $msg = "WinSCP finished with skipped items (exit code 1) - likely a directory that could not be created. Check $winScpLog"
+        Write-Log "WARNING: $msg"
+        $warnings += $msg
+    }
+    default {
+        Add-Failure "WinSCP Sync" "Exit Code: $LASTEXITCODE. Check $winScpLog"
+        Write-Log "ERROR: WinSCP Sync failed with exit code $LASTEXITCODE"
+    }
 }
 
 # ============================================================================
@@ -213,9 +247,16 @@ Add-Content -Path $actionLog -Value "=== Sync Finished: $(Get-Date) ===`n" -Enco
 # ============================================================================
 # 6. Summary
 # ============================================================================
+if ($warnings.Count -gt 0) {
+    Write-Host "Warnings (non-fatal):" -ForegroundColor Yellow
+    $warnings | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+}
+
 if ($failedResults.Count -gt 0) {
-    Write-Host "Process completed with errors. Review the table below and the log file at $actionLog" -ForegroundColor Yellow
+    Write-Host "Process completed with errors. Review the table below and the log file at $actionLog" -ForegroundColor Red
     $failedResults | Format-Table -AutoSize
+} elseif ($warnings.Count -gt 0) {
+    Write-Host "Sync completed with warnings (some items skipped). Details logged at $actionLog" -ForegroundColor Yellow
 } else {
     Write-Host "Sync and local cleanup completed successfully. Full details logged at $actionLog" -ForegroundColor Green
 }
