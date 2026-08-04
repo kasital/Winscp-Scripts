@@ -37,6 +37,7 @@ $ledgerFile = Join-Path $sftpDir "downloaded_ledger.txt"
 
 # Connection details
 $hostName   = "78.43.22.66"
+$portNumber = 22                                     # <-- set your custom SFTP port here
 $userName   = "test"
 $password   = "password"
 $sshHostKey = "ssh-rsa 2048 <rsa>"                   # <-- put the REAL fingerprint here
@@ -103,6 +104,7 @@ Write-Log "Ledger loaded: $($ledger.Count) entry(ies) previously downloaded."
 $sessionOptions = New-Object WinSCP.SessionOptions -Property @{
     Protocol              = [WinSCP.Protocol]::Sftp
     HostName              = $hostName
+    PortNumber            = $portNumber
     UserName              = $userName
     Password              = $password
     SshHostKeyFingerprint = $sshHostKey
@@ -122,7 +124,7 @@ $uploadedFiles = @()
 
 try {
     $session.Open($sessionOptions)
-    Write-Log "Connected to $hostName."
+    Write-Log "Connected to ${hostName}:${portNumber}."
 
     # ------------------------------------------------------------------------
     # 1. UPLOAD: local TO -> remote /FROM_REUTH/  (existing directories only)
