@@ -23,8 +23,8 @@
       Setting the remote modification time requires file ownership, which we
       do not have. Attempting it causes the file to be reported as failed.
 
-    Download uses "synchronize local", which is safe: it only reads from the
-    server and creates directories locally.
+    Download uses "get -delete": each file is downloaded and then removed from
+    the server, so it is not retrieved again on the next run.
 #>
 
 # ============================================================================
@@ -120,9 +120,13 @@ foreach ($file in $pending) {
     Write-Log "queued upload: $($file.FullName) -> $remoteDir"
 }
 
-# ---- Download: safe, only reads remote and writes locally -------------------
-$commands.Add("option batch abort")
-$commands.Add("synchronize local -nopreservetime -resumesupport=off ""$localFrom"" ""$remoteDownloadRoot""")
+# ---- Download: retrieve, then delete the file on the server ----------------
+# batch continue: if removing an emptied remote *directory* is denied, that is
+# only a warning - the files themselves were already downloaded and deleted.
+$commands.Add("option batch continue")
+$commands.Add("lcd ""$localFrom""")
+$commands.Add("cd ""$($remoteDownloadRoot.TrimEnd('/'))""")
+$commands.Add("get -delete -nopreservetime -resumesupport=off *")
 $commands.Add("exit")
 
 $commands -join "`r`n" | Set-Content -Path $syncScript -Encoding UTF8
