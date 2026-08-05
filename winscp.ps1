@@ -42,6 +42,7 @@ $userName   = "test"
 $password   = "password"
 $sshHostKey = "ssh-rsa 2048 <rsa>"                   # <-- put the REAL fingerprint here
 $privateKey = "C:\Keys\MOH\ReuthPrivatMOH.ppk"       # set to $null for password-only auth
+$privateKeyPassphrase = $null                        # passphrase protecting the .ppk, if any
 
 # Retention (days)
 $deleteBackupAfterDays = 14
@@ -109,8 +110,19 @@ $sessionOptions = New-Object WinSCP.SessionOptions -Property @{
     Password              = $password
     SshHostKeyFingerprint = $sshHostKey
 }
-if ($privateKey -and (Test-Path -LiteralPath $privateKey)) {
+if ($privateKey) {
+    if (-not (Test-Path -LiteralPath $privateKey)) {
+        Write-Host "ERROR: Private key configured but not found at: $privateKey" -ForegroundColor Red
+        Write-Log "ERROR: Private key not found at $privateKey. Aborting."
+        exit 1
+    }
     $sessionOptions.SshPrivateKeyPath = $privateKey
+    if ($privateKeyPassphrase) {
+        $sessionOptions.PrivateKeyPassphrase = $privateKeyPassphrase
+    }
+    Write-Log "Using private key: $privateKey"
+} else {
+    Write-Log "No private key configured - password authentication only."
 }
 
 # Transfer settings: never try to set remote timestamps.
@@ -120,6 +132,7 @@ $transferOptions.TransferMode      = [WinSCP.TransferMode]::Binary
 $transferOptions.PreserveTimestamp = $false
 
 $session = New-Object WinSCP.Session
+$session.SessionLogPath = Join-Path $sftpDir "WinScpSession_$dateStamp.log"
 $uploadedFiles = @()
 
 try {
