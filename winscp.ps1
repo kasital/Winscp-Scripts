@@ -1,19 +1,30 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    SFTP exchange with Reuth / MOH using file-only operations.
+    SFTP exchange with Reuth / MOH via WinSCP.com (URL-based session).
 
 .DESCRIPTION
-    Server permissions are limited to: upload files, download files.
-    NO directory creation, NO deletion on the server.
+    Server permissions are limited: upload and download files only.
+    NO directory creation, NO deletion, NO rename on the server.
 
-    Therefore this script never calls mkdir or rm remotely. It only:
-      UPLOAD   local  C:\SafesMOH\TO    ->  remote /FROM_REUTH/   (existing dirs only)
-      DOWNLOAD remote /TO_REUTH/        ->  local  C:\SafesMOH\FROM
+    Directions:
+      UPLOAD    local  C:\SafesMOH\toMOH    ->  remote /FROM_REUTH/   (existing dirs only)
+      DOWNLOAD  remote /TO_REUTH/           ->  local  C:\SafesMOH\FROMMOH
 
-    Because files are never deleted from the server, a local ledger records what
-    has already been downloaded, so archived files are not fetched again.
-    Uploaded files are moved into a local Sent archive so they are not re-sent.
+    Why explicit "put" instead of "synchronize remote":
+      synchronize wants to create remote directories, which is denied here.
+      "put" only writes files into directories that already exist.
+
+    Why -resumesupport=off:
+      WinSCP would upload to "<name>.filepart" and then RENAME it to the final
+      name. This server denies rename, so the transfer failed at the last step.
+
+    Why -nopreservetime:
+      Setting the remote modification time requires file ownership, which we
+      do not have. Attempting it causes the file to be reported as failed.
+
+    Download uses "synchronize local", which is safe: it only reads from the
+    server and creates directories locally.
 #>
 
 # ============================================================================
@@ -22,27 +33,24 @@
 $dateStamp = Get-Date -Format "yyyyMMdd"
 
 # Local directories (no trailing backslash)
-$localFrom = "C:\SafesMOH\FROM"     # inbox  - files downloaded from the server
-$localTo   = "C:\SafesMOH\TO"       # outbox - files waiting to be uploaded
+$localFrom = "C:\SafesMOH\FROMMOH"   # inbox  - receives from remote /TO_REUTH/
+$localTo   = "C:\SafesMOH\toMOH"     # outbox - sends to remote /FROM_REUTH/
 $backupDir = "C:\SafesMOH\Backup"
 
 # Remote directories
-$remoteUploadRoot   = "/FROM_REUTH/"   # we upload here
-$remoteDownloadRoot = "/TO_REUTH/"     # we download from here
+$remoteUploadRoot   = "/FROM_REUTH/"
+$remoteDownloadRoot = "/TO_REUTH/"
 
 # Working paths
 $sftpDir    = "C:\SFTP"
+$syncScript = Join-Path $sftpDir "SyncScript.txt"
 $actionLog  = Join-Path $sftpDir "ScriptActions_$dateStamp.log"
-$ledgerFile = Join-Path $sftpDir "downloaded_ledger.txt"
+$winScpLog  = Join-Path $sftpDir "WinScpLog_$dateStamp.log"
+$winScpXml  = Join-Path $sftpDir "WinScpLog_$dateStamp.xml"
 
-# Connection details
-$hostName   = "78.43.22.66"
-$portNumber = 22                                     # <-- set your custom SFTP port here
-$userName   = "test"
-$password   = "password"
-$sshHostKey = "ssh-rsa 2048 <rsa>"                   # <-- put the REAL fingerprint here
-$privateKey = "C:\Keys\MOH\ReuthPrivatMOH.ppk"       # set to $null for password-only auth
-$privateKeyPassphrase = $null                        # passphrase protecting the .ppk, if any
+# ---- Connection (the form that is known to work) ---------------------------
+# Add :PORT after the host if you use a non-standard port, e.g. @78.43.22.66:2222/
+$sessionUrl = 'sftp://REUTH_SFTP:password@78.43.22.66/ -hostkey="ssh-rsa 2048 <rsa>" -privatekey="C:\Keys\MOH\ReuthPrivatMOH.ppk"'
 
 # Retention (days)
 $deleteBackupAfterDays = 14
@@ -71,181 +79,131 @@ foreach ($dir in @($localFrom, $localTo, $backupDir, $sftpDir)) {
 }
 Add-Content -Path $actionLog -Value "=== Sync Started: $(Get-Date) ===" -Encoding UTF8
 
-# Load the WinSCP .NET assembly
-$dllCandidates = @(
-    "C:\Program Files (x86)\WinSCP\WinSCPnet.dll",
-    "C:\Program Files\WinSCP\WinSCPnet.dll",
-    (Join-Path $sftpDir "WinSCPnet.dll")
-)
-$dllPath = $dllCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-if (-not $dllPath) {
-    $found = Get-ChildItem -Path "C:\Program Files*" -Filter "WinSCPnet.dll" -Recurse -ErrorAction SilentlyContinue |
+# Locate WinSCP.com
+$winScpPath = @(
+    "C:\Program Files (x86)\WinSCP\WinSCP.com",
+    "C:\Program Files\WinSCP\WinSCP.com"
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+if (-not $winScpPath) {
+    $found = Get-ChildItem -Path "C:\Program Files*" -Filter "WinSCP.com" -Recurse -ErrorAction SilentlyContinue |
              Select-Object -First 1
-    if ($found) { $dllPath = $found.FullName }
+    if ($found) { $winScpPath = $found.FullName }
 }
-if (-not $dllPath) {
-    Write-Host "ERROR: WinSCPnet.dll not found." -ForegroundColor Red
-    Write-Host "       Install the WinSCP .NET assembly, or copy WinSCPnet.dll into $sftpDir" -ForegroundColor Red
-    Write-Log "ERROR: WinSCPnet.dll not found. Aborting."
+if (-not $winScpPath) {
+    Write-Host "ERROR: WinSCP.com not found." -ForegroundColor Red
+    Write-Log "ERROR: WinSCP.com not found. Aborting."
     exit 1
 }
-Add-Type -Path $dllPath
-Write-Log "Loaded WinSCP assembly: $dllPath"
-
-# Load ledger of already-downloaded remote files
-$ledger = New-Object System.Collections.Generic.HashSet[string]
-if (Test-Path -LiteralPath $ledgerFile) {
-    Get-Content -LiteralPath $ledgerFile | Where-Object { $_ } | ForEach-Object { [void]$ledger.Add($_.Trim()) }
-}
-Write-Log "Ledger loaded: $($ledger.Count) entry(ies) previously downloaded."
+Write-Log "Using WinSCP: $winScpPath"
 
 # ============================================================================
-# Session setup
+# 1. Build the command list
 # ============================================================================
-$sessionOptions = New-Object WinSCP.SessionOptions -Property @{
-    Protocol              = [WinSCP.Protocol]::Sftp
-    HostName              = $hostName
-    PortNumber            = $portNumber
-    UserName              = $userName
-    Password              = $password
-    SshHostKeyFingerprint = $sshHostKey
-}
-if ($privateKey) {
-    if (-not (Test-Path -LiteralPath $privateKey)) {
-        Write-Host "ERROR: Private key configured but not found at: $privateKey" -ForegroundColor Red
-        Write-Log "ERROR: Private key not found at $privateKey. Aborting."
-        exit 1
+$pending = @(Get-ChildItem -Path $localTo -File -Recurse -ErrorAction SilentlyContinue)
+Write-Log "Upload queue: $($pending.Count) file(s) in $localTo"
+
+$commands = New-Object System.Collections.Generic.List[string]
+$commands.Add("option batch continue")   # a denied item is skipped, not fatal
+$commands.Add("option confirm off")
+$commands.Add("open $sessionUrl")
+
+# ---- Uploads: one explicit put per file, into existing remote folders -------
+foreach ($file in $pending) {
+    $relativeDir = $file.DirectoryName.Substring($localTo.Length).TrimStart('\')
+    $remoteDir = if ($relativeDir) {
+        $remoteUploadRoot.TrimEnd('/') + '/' + ($relativeDir -replace '\\','/') + '/'
+    } else {
+        $remoteUploadRoot
     }
-    $sessionOptions.SshPrivateKeyPath = $privateKey
-    if ($privateKeyPassphrase) {
-        $sessionOptions.PrivateKeyPassphrase = $privateKeyPassphrase
-    }
-    Write-Log "Using private key: $privateKey"
-} else {
-    Write-Log "No private key configured - password authentication only."
+    $commands.Add("put -nopreservetime -resumesupport=off ""$($file.FullName)"" ""$remoteDir""")
+    Write-Log "queued upload: $($file.FullName) -> $remoteDir"
 }
 
-# Transfer settings: never try to set remote timestamps.
-# Setting mtime requires file ownership, which we do not have.
-$transferOptions = New-Object WinSCP.TransferOptions
-$transferOptions.TransferMode      = [WinSCP.TransferMode]::Binary
-$transferOptions.PreserveTimestamp = $false
+# ---- Download: safe, only reads remote and writes locally -------------------
+$commands.Add("option batch abort")
+$commands.Add("synchronize local -nopreservetime -resumesupport=off ""$localFrom"" ""$remoteDownloadRoot""")
+$commands.Add("exit")
 
-$session = New-Object WinSCP.Session
-$session.SessionLogPath = Join-Path $sftpDir "WinScpSession_$dateStamp.log"
-$uploadedFiles = @()
+$commands -join "`r`n" | Set-Content -Path $syncScript -Encoding UTF8
 
-try {
-    $session.Open($sessionOptions)
-    Write-Log "Connected to ${hostName}:${portNumber}."
+# ============================================================================
+# 2. Run WinSCP
+# ============================================================================
+Write-Log "Starting WinSCP session."
+& "$winScpPath" /script="$syncScript" /log="$winScpLog" /xmllog="$winScpXml" /ini=nul
+$exitCode = $LASTEXITCODE
 
-    # ------------------------------------------------------------------------
-    # 1. UPLOAD: local TO -> remote /FROM_REUTH/  (existing directories only)
-    # ------------------------------------------------------------------------
-    $pending = @(Get-ChildItem -Path $localTo -File -Recurse -ErrorAction SilentlyContinue)
-    Write-Log "Upload queue: $($pending.Count) file(s) in $localTo"
+switch ($exitCode) {
+    0 { Write-Log "WinSCP finished successfully." }
+    1 {
+        $msg = "WinSCP finished with skipped items (exit code 1). See $winScpXml"
+        Write-Log "WARNING: $msg"
+        $warnings += $msg
+    }
+    default {
+        Add-Failure "WinSCP" "Exit code: $exitCode. See $winScpLog"
+        Write-Log "ERROR: WinSCP failed with exit code $exitCode"
+    }
+}
 
-    # Probe each remote directory only once
-    $remoteDirCache = @{}
+# ============================================================================
+# 3. Parse the XML log: which uploads actually succeeded?
+# ============================================================================
+$uploadedPaths = New-Object System.Collections.Generic.HashSet[string]
 
-    foreach ($file in $pending) {
-        # Build the remote target path, preserving any local subfolder structure
-        $relativeDir = $file.DirectoryName.Substring($localTo.Length).TrimStart('\')
-        $remoteDir = if ($relativeDir) {
-            $remoteUploadRoot.TrimEnd('/') + '/' + ($relativeDir -replace '\\','/') + '/'
-        } else {
-            $remoteUploadRoot
+if (Test-Path -LiteralPath $winScpXml) {
+    try {
+        [xml]$xml = Get-Content -LiteralPath $winScpXml -Raw
+        $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+        $ns.AddNamespace("w", "http://winscp.net/schema/session/1.0")
+
+        foreach ($u in $xml.SelectNodes("//w:upload", $ns)) {
+            $src = $u.filename.value
+            if ($u.result.success -eq "true") {
+                Write-Log "UPLOADED: $src"
+                [void]$uploadedPaths.Add($src)
+            } else {
+                $reason = $u.result.message
+                Write-Log "UPLOAD FAILED: $src - $reason"
+                Add-Failure "Upload" "$([System.IO.Path]::GetFileName($src)) - $reason"
+            }
         }
 
-        # We cannot create directories, so verify the target exists first
-        if (-not $remoteDirCache.ContainsKey($remoteDir)) {
-            try   { $remoteDirCache[$remoteDir] = $session.FileExists($remoteDir.TrimEnd('/')) }
-            catch { $remoteDirCache[$remoteDir] = $false }
+        $dl = @($xml.SelectNodes("//w:download", $ns))
+        Write-Log "Downloads attempted: $($dl.Count)"
+        foreach ($d in $dl) {
+            if ($d.result.success -eq "true") {
+                Write-Log "DOWNLOADED: $($d.filename.value)"
+            } else {
+                Write-Log "DOWNLOAD FAILED: $($d.filename.value) - $($d.result.message)"
+                Add-Failure "Download" "$($d.filename.value) - $($d.result.message)"
+            }
         }
-        if (-not $remoteDirCache[$remoteDir]) {
-            $msg = "Remote folder missing and cannot be created: $remoteDir"
-            Write-Log "SKIP: $msg (file: $($file.Name))"
+
+        if ($pending.Count -gt 0 -and $uploadedPaths.Count -eq 0) {
+            $msg = "$($pending.Count) file(s) were queued but NONE uploaded. See $winScpXml"
+            Write-Host $msg -ForegroundColor Red
+            Write-Log "WARNING: $msg"
             $warnings += $msg
-            continue
         }
-
-        $remotePath = $remoteDir + $file.Name
-        try {
-            $result = $session.PutFiles($file.FullName, $session.EscapeFileMask($remotePath), $false, $transferOptions)
-            if ($result.IsSuccess) {
-                Write-Log "UPLOADED: $($file.FullName) -> $remotePath"
-                $uploadedFiles += $file
-            } else {
-                foreach ($f in $result.Failures) {
-                    Write-Log "UPLOAD FAILED: $($file.Name) - $($f.Message)"
-                    Add-Failure "Upload" "$($file.Name) - $($f.Message)"
-                }
-            }
-        } catch {
-            Write-Log "UPLOAD ERROR: $($file.Name) - $($_.Exception.Message)"
-            Add-Failure "Upload" "$($file.Name) - $($_.Exception.Message)"
-        }
+    } catch {
+        Write-Log "Could not parse XML log: $($_.Exception.Message)"
     }
-
-    # ------------------------------------------------------------------------
-    # 2. DOWNLOAD: remote /TO_REUTH/ -> local FROM, new files only
-    #    The server never deletes, so the ledger decides what counts as new.
-    # ------------------------------------------------------------------------
-    Write-Log "Enumerating remote $remoteDownloadRoot ..."
-    $remoteFiles = $session.EnumerateRemoteFiles(
-        $remoteDownloadRoot, $null, [WinSCP.EnumerationOptions]::AllDirectories)
-
-    $newCount = 0
-    foreach ($rf in $remoteFiles) {
-        if ($rf.IsDirectory) { continue }
-
-        # Key includes size + mtime so a replaced file is fetched again
-        $key = "{0}|{1}|{2}" -f $rf.FullName, $rf.Length, $rf.LastWriteTime.ToString("yyyyMMddHHmmss")
-        if ($ledger.Contains($key)) { continue }
-
-        # Mirror the remote subfolder structure locally (local mkdir is fine)
-        $relative       = $rf.FullName.Substring($remoteDownloadRoot.TrimEnd('/').Length).TrimStart('/')
-        $localTarget    = Join-Path $localFrom ($relative -replace '/','\')
-        $localTargetDir = Split-Path -Parent $localTarget
-        if (-not (Test-Path -LiteralPath $localTargetDir)) {
-            New-Item -Path $localTargetDir -ItemType Directory -Force | Out-Null
-        }
-
-        try {
-            $result = $session.GetFiles($session.EscapeFileMask($rf.FullName), $localTarget, $false, $transferOptions)
-            if ($result.IsSuccess) {
-                Write-Log "DOWNLOADED: $($rf.FullName) -> $localTarget"
-                Add-Content -Path $ledgerFile -Value $key -Encoding UTF8
-                [void]$ledger.Add($key)
-                $newCount++
-            } else {
-                foreach ($f in $result.Failures) {
-                    Write-Log "DOWNLOAD FAILED: $($rf.FullName) - $($f.Message)"
-                    Add-Failure "Download" "$($rf.Name) - $($f.Message)"
-                }
-            }
-        } catch {
-            Write-Log "DOWNLOAD ERROR: $($rf.FullName) - $($_.Exception.Message)"
-            Add-Failure "Download" "$($rf.Name) - $($_.Exception.Message)"
-        }
-    }
-    Write-Log "Download complete: $newCount new file(s)."
-
-} catch {
-    Write-Log "SESSION ERROR: $($_.Exception.Message)"
-    Add-Failure "Session" $_.Exception.Message
-} finally {
-    $session.Dispose()
 }
 
 # ============================================================================
-# 3. Archive successfully uploaded files so they are not re-sent
+# 4. Move successfully uploaded files to the Sent archive (prevents re-sending)
 # ============================================================================
 $sentRoot = Join-Path (Join-Path $backupDir "Sent") $dateStamp
-foreach ($file in $uploadedFiles) {
+
+foreach ($file in $pending) {
+    if (-not $uploadedPaths.Contains($file.FullName)) { continue }
+
     $relativeDir = $file.DirectoryName.Substring($localTo.Length).TrimStart('\')
     $target = if ($relativeDir) { Join-Path $sentRoot $relativeDir } else { $sentRoot }
     if (-not (Test-Path -LiteralPath $target)) { New-Item -Path $target -ItemType Directory -Force | Out-Null }
+
     try {
         Move-Item -LiteralPath $file.FullName -Destination $target -Force -ErrorAction Stop
         Write-Log "Archived sent file: $($file.Name)"
@@ -255,7 +213,7 @@ foreach ($file in $uploadedFiles) {
 }
 
 # ============================================================================
-# 4. Retention: delete old local archive snapshots and old logs
+# 5. Retention
 # ============================================================================
 $cutoffBackup = (Get-Date).AddDays(-$deleteBackupAfterDays)
 $sentParent = Join-Path $backupDir "Sent"
@@ -277,7 +235,7 @@ if (Test-Path -LiteralPath $sentParent) {
 }
 
 $cutoffLogs = (Get-Date).AddDays(-$deleteLogsAfterDays)
-Get-ChildItem -Path $sftpDir -File -Filter "*.log" |
+Get-ChildItem -Path $sftpDir -File -Include "*.log","*.xml" -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt $cutoffLogs } |
     ForEach-Object {
         try   { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
@@ -287,7 +245,7 @@ Get-ChildItem -Path $sftpDir -File -Filter "*.log" |
 Add-Content -Path $actionLog -Value "=== Sync Finished: $(Get-Date) ===`n" -Encoding UTF8
 
 # ============================================================================
-# 5. Summary
+# 6. Summary
 # ============================================================================
 if ($warnings.Count -gt 0) {
     Write-Host "Warnings (non-fatal):" -ForegroundColor Yellow
@@ -297,5 +255,5 @@ if ($failedResults.Count -gt 0) {
     Write-Host "Completed with errors. See $actionLog" -ForegroundColor Red
     $failedResults | Format-Table -AutoSize
 } else {
-    Write-Host "Completed. Uploaded $($uploadedFiles.Count) file(s). Details in $actionLog" -ForegroundColor Green
+    Write-Host "Completed. Uploaded $($uploadedPaths.Count) file(s). Details in $actionLog" -ForegroundColor Green
 }
