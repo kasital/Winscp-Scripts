@@ -23,8 +23,9 @@
       Setting the remote modification time requires file ownership, which we
       do not have. Attempting it causes the file to be reported as failed.
 
-    Download uses "get -delete": each file is downloaded and then removed from
-    the server, so it is not retrieved again on the next run.
+    Download is a two-phase operation: first "get" retrieves the files, then a
+    second pass issues one "rm" per successfully downloaded FILE. Directories
+    are never deleted, because rmdir is denied on this server.
 #>
 
 # ============================================================================
@@ -120,13 +121,12 @@ foreach ($file in $pending) {
     Write-Log "queued upload: $($file.FullName) -> $remoteDir"
 }
 
-# ---- Download: retrieve, then delete the file on the server ----------------
-# batch continue: if removing an emptied remote *directory* is denied, that is
-# only a warning - the files themselves were already downloaded and deleted.
+# ---- Download: retrieve only. Deletion is done afterwards, per FILE, so we
+#      never attempt to remove a remote directory (rmdir is denied here).
 $commands.Add("option batch continue")
 $commands.Add("lcd ""$localFrom""")
 $commands.Add("cd ""$($remoteDownloadRoot.TrimEnd('/'))""")
-$commands.Add("get -delete -nopreservetime -resumesupport=off *")
+$commands.Add("get -nopreservetime -resumesupport=off *")
 $commands.Add("exit")
 
 $commands -join "`r`n" | Set-Content -Path $syncScript -Encoding UTF8
@@ -155,6 +155,7 @@ switch ($exitCode) {
 # 3. Parse the XML log: which uploads actually succeeded?
 # ============================================================================
 $uploadedPaths = New-Object System.Collections.Generic.HashSet[string]
+$downloadedRemotePaths = New-Object System.Collections.Generic.List[string]
 
 if (Test-Path -LiteralPath $winScpXml) {
     try {
@@ -179,6 +180,7 @@ if (Test-Path -LiteralPath $winScpXml) {
         foreach ($d in $dl) {
             if ($d.result.success -eq "true") {
                 Write-Log "DOWNLOADED: $($d.filename.value)"
+                [void]$downloadedRemotePaths.Add($d.filename.value)
             } else {
                 Write-Log "DOWNLOAD FAILED: $($d.filename.value) - $($d.result.message)"
                 Add-Failure "Download" "$($d.filename.value) - $($d.result.message)"
@@ -193,6 +195,51 @@ if (Test-Path -LiteralPath $winScpXml) {
         }
     } catch {
         Write-Log "Could not parse XML log: $($_.Exception.Message)"
+    }
+}
+
+# ============================================================================
+# 3b. Delete the downloaded FILES on the server (files only, never directories)
+# ============================================================================
+if ($downloadedRemotePaths.Count -gt 0) {
+    Write-Log "Removing $($downloadedRemotePaths.Count) downloaded file(s) from the server."
+
+    $delScript = Join-Path $sftpDir "DeleteScript.txt"
+    $delXml    = Join-Path $sftpDir "WinScpDelete_$dateStamp.xml"
+
+    $delCommands = New-Object System.Collections.Generic.List[string]
+    $delCommands.Add("option batch continue")
+    $delCommands.Add("option confirm off")
+    $delCommands.Add("open $sessionUrl")
+    foreach ($rp in $downloadedRemotePaths) {
+        # One explicit rm per file. Directories are never referenced.
+        $delCommands.Add("rm ""$rp""")
+    }
+    $delCommands.Add("exit")
+    $delCommands -join "`r`n" | Set-Content -Path $delScript -Encoding UTF8
+
+    & "$winScpPath" /script="$delScript" /log="$winScpLog" /xmllog="$delXml" /ini=nul
+    $delExit = $LASTEXITCODE
+
+    if (Test-Path -LiteralPath $delXml) {
+        try {
+            [xml]$dxml = Get-Content -LiteralPath $delXml -Raw
+            $dns = New-Object System.Xml.XmlNamespaceManager($dxml.NameTable)
+            $dns.AddNamespace("w", "http://winscp.net/schema/session/1.0")
+            foreach ($r in $dxml.SelectNodes("//w:rm", $dns)) {
+                if ($r.result.success -eq "true") {
+                    Write-Log "REMOTE DELETED: $($r.filename.value)"
+                } else {
+                    $m = "Could not delete on server: $($r.filename.value) - $($r.result.message)"
+                    Write-Log "WARNING: $m"
+                    $warnings += $m
+                }
+            }
+        } catch {
+            Write-Log "Could not parse delete XML log: $($_.Exception.Message)"
+        }
+    } elseif ($delExit -ne 0) {
+        $warnings += "Remote cleanup finished with exit code $delExit. See $winScpLog"
     }
 }
 
