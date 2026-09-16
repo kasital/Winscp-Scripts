@@ -23,7 +23,18 @@ $SftpHost      = "sftp.example.com"        # SFTP server address / IP
 $SftpPort      = 22
 $SftpUser      = "USERNAME"
 $SftpPassword  = "PASSWORD"                # strongly recommended: move to secure storage (see note at the end)
-$HostFingerprint = "ssh-rsa 2048 xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"  # obtain via WinSCP GUI on first connect
+$HostFingerprint = ""  # REQUIRED: paste the real server fingerprint here (see instructions below), e.g. "ssh-rsa 2048 aa:bb:cc:...:zz"
+
+# How to obtain the fingerprint:
+#   1) Open WinSCP GUI and connect to the same server with the same credentials.
+#   2) On first connect you'll get a "host key not verified" warning showing the fingerprint - copy it exactly.
+#   3) Alternatively, after connecting once, check Session Log (or Server/Protocol Information) for the "Host key fingerprint" line.
+#   4) Paste the exact string (protocol + bit length + colon-separated hex) into $HostFingerprint above.
+#
+# For a one-time bootstrap ONLY (not recommended long-term), you can instead skip fingerprint
+# verification entirely by setting $sessionOptions.GiveUpSecurityAndAcceptAnySshHostKey = $true
+# right after creating $sessionOptions below - then check the log/console output for the real
+# fingerprint and paste it into $HostFingerprint, then remove the GiveUp line.
 
 $RemoteUploadPath   = "/upload/BTL/"       # remote folder - upload target (From-BTL -> server)
 $RemoteDownloadPath = "/download/BTL/"     # remote folder - download source (server -> To-BTL)
